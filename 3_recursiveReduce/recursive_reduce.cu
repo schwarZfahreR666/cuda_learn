@@ -64,9 +64,18 @@ __global__ void reduceNeighbored(int * g_idata,int * g_odata,unsigned int n)
 	if (tid >= n) return;
 	//convert global data pointer to the
     //获取线程块内数据起始地址 
+	//最好给每个block做一个内存起始指针，以防止索引混乱
 	int *idata = g_idata + blockIdx.x*blockDim.x;
 	//in-place reduction in global memory
     //循环规约一个block中的元素，相邻配对
+	/*
+	以thread_0为例分析行为
+		thread_0 += thread_1
+		thread_0 += thread_2
+		thread_0 += thread_4
+		 ...
+	但是要考虑线程块中所有的线程如何分化
+	*/
 	for (int stride = 1; stride < blockDim.x; stride *= 2)
 	{
 		if ((tid % (2 * stride)) == 0) //每次规约相邻的线程都不会同时工作，会有分化
@@ -143,6 +152,91 @@ __global__ void reduceInterleaved(int * g_idata, int *g_odata, unsigned int n)
 		g_odata[blockIdx.x] = idata[0];
 }
 
+/*使用共享内存*/
+//相邻配对规约，共享内存
+__global__ void reduceNeighbored_shared(int * g_idata,int * g_odata,unsigned int n) 
+{
+	//使用动态共享内存
+	extern __shared__ int shared_m[];
+	//set thread ID
+	unsigned int tid = threadIdx.x;
+	//boundary check
+	if (tid >= n) return;
+	//convert global data pointer to the
+    //获取线程块内数据起始地址 
+	//最好给每个block做一个内存起始指针，以防止索引混乱
+	int *idata = g_idata + blockIdx.x*blockDim.x;
+	//每个线程搬运一个数
+	shared_m[tid] = idata[tid];
+	__syncthreads();
+	//in-place reduction in global memory
+    //循环规约一个block中的元素，相邻配对
+	/*
+	以thread_0为例分析行为
+		thread_0 += thread_1
+		thread_0 += thread_2
+		thread_0 += thread_4
+		 ...
+	但是要考虑线程块中所有的线程如何分化
+	*/
+	for (int stride = 1; stride < blockDim.x; stride *= 2)
+	{
+		if ((tid % (2 * stride)) == 0) //每次规约相邻的线程都不会同时工作，会有分化
+		{
+            //相隔stride的两个元素规约
+			shared_m[tid] += shared_m[tid + stride];
+		}
+		//synchronize within block
+		__syncthreads();
+	}
+	//write result for this block to global mem
+    //写到块索引对应的输出内存中
+	if (tid == 0)
+		g_odata[blockIdx.x] = shared_m[0];
+
+}
+
+
+__global__ void reduceNeighboredLess_shared(int * g_idata,int *g_odata,unsigned int n)
+{
+	//使用动态共享内存
+	extern __shared__ int shared_m[];
+	unsigned int tid = threadIdx.x;
+    //拿到全局线程id
+	unsigned idx = blockIdx.x*blockDim.x + threadIdx.x;
+	// convert global data pointer to the local point of this block
+    //内存块对应内存的起始地址
+	int *idata = g_idata + blockIdx.x*blockDim.x;
+	if (idx > n)
+		return;
+	//每个线程搬运一个数
+	shared_m[tid] = idata[tid];
+	__syncthreads();
+	//in-place reduction in global memory
+	for (int stride = blockDim.x / 2; stride > 0; stride /= 2)
+	{
+		//convert tid into local array index
+        //把需要规约的数据id映射到连续的线程id上
+        //让tid向后移动到需要规约的数据处
+		int index = tid;
+        /* (tid/index[A,B]) 
+		只看同一个warp中是否会有bank冲突   
+        第一轮：0/[0, 1] 1/[2, 3] 2/[4, 5] 3/[6, 7] ... 16/[32, 33](32与0 bank冲突)
+        第二轮：0/[0, 2] 1/[4, 6] ... 8/[32, 34](与0冲突)
+        第三轮：0/[0, 4]
+
+		所以改成每个线程去访问tid和tid + reduce_num / 2的元素
+        */
+		if (index < stride)
+		{
+			shared_m[index] += shared_m[index + stride];
+		}
+		__syncthreads();
+	}
+	//write result for this block to global men
+	if (tid == 0)
+		g_odata[blockIdx.x] = shared_m[0];
+}
 
 int main(int argc,char** argv)
 {
@@ -302,6 +396,32 @@ int main(int argc,char** argv)
 	for (int i = 0; i < grid.x; i++)
 		gpu_sum += odata_host[i];
 	printf("gpu reduceInterleaved      elapsed %lf ms gpu_sum: %d<<<grid %d block %d>>>\n",
+		iElaps, gpu_sum, grid.x, block.x);
+
+	CHECK(cudaMemcpy(idata_dev, idata_host, bytes, cudaMemcpyHostToDevice));
+	CHECK(cudaDeviceSynchronize());
+	iStart = cpuSecond();
+	reduceNeighbored_shared << <grid, block , blocksize * sizeof(int)>> >(idata_dev, odata_dev, size);
+	cudaDeviceSynchronize();
+	iElaps = cpuSecond() - iStart;
+	cudaMemcpy(odata_host, odata_dev, grid.x * sizeof(int), cudaMemcpyDeviceToHost);
+	gpu_sum = 0;
+	for (int i = 0; i < grid.x; i++)
+		gpu_sum += odata_host[i];
+	printf("gpu reduceNeighbored_shared      elapsed %lf ms gpu_sum: %d<<<grid %d block %d>>>\n",
+		iElaps, gpu_sum, grid.x, block.x);
+
+	CHECK(cudaMemcpy(idata_dev, idata_host, bytes, cudaMemcpyHostToDevice));
+	CHECK(cudaDeviceSynchronize());
+	iStart = cpuSecond();
+	reduceNeighboredLess_shared << <grid, block , blocksize * sizeof(int)>> >(idata_dev, odata_dev, size);
+	cudaDeviceSynchronize();
+	iElaps = cpuSecond() - iStart;
+	cudaMemcpy(odata_host, odata_dev, grid.x * sizeof(int), cudaMemcpyDeviceToHost);
+	gpu_sum = 0;
+	for (int i = 0; i < grid.x; i++)
+		gpu_sum += odata_host[i];
+	printf("gpu reduceNeighboredLess_shared      elapsed %lf ms gpu_sum: %d<<<grid %d block %d>>>\n",
 		iElaps, gpu_sum, grid.x, block.x);
 	// free host memory
 
