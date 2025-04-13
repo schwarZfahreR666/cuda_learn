@@ -1,0 +1,1 @@
+add_executable(recursive_reduce recursive_reduce.cu)
