@@ -35,7 +35,7 @@ __global__ void warmup(int * g_idata, int * g_odata, unsigned int n)
 	//boundary check
 	if (tid >= n) return;
 	//convert global data pointer to the
-    //获取线程块内数据起始地址 
+    //为了索引不乱，获取线程块内数据起始地址 
 	int *idata = g_idata + blockIdx.x*blockDim.x;
 	//in-place reduction in global memory
     //循环规约一个block中的元素，相邻配对
@@ -126,7 +126,8 @@ __global__ void reduceNeighboredLess(int * g_idata,int *g_odata,unsigned int n)
 		g_odata[blockIdx.x] = idata[0];
 }
 //交错规约
-//从线程分化角度或者合并访存角度看，都是最好的
+//从线程分化角度或者合并访存(一个warp中所有线程同时访问的内存地址是连续的，
+//可以在一次访存中连续读出多个数)角度看，都是最好的
 //但是实际实验结果与理论不符
 __global__ void reduceInterleaved(int * g_idata, int *g_odata, unsigned int n)
 {
@@ -255,7 +256,7 @@ __global__ void reduceNeighbored_shared_skip_halfthread(int * g_idata,int *g_oda
 	int *idata_next = idata + blockDim.x;
 	if (idx > n)
 		return;
-	//每个线程搬运一个数
+	//每个线程搬运一个数，搬数的时候就把相应位置的加法计算出来
 	shared_m[tid] = idata[tid] + idata_next[tid];
 	__syncthreads();
 	//in-place reduction in global memory
