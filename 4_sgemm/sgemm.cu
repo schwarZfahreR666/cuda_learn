@@ -50,10 +50,64 @@ __global__ void simple_sgemm(float* A, float* B, float* C, const int M, const in
     C[y * N + x] = temp;
 }
 
+//使用shared memory，读取内存次数从2KMN降为KMN(1/Bn+1/Bm)
+//但是每个block都加载block_size * k的数据，使用了太多共享内存
+template<unsigned int BLOCK_SIZE_X, unsigned int BLOCK_SIZE_Y, unsigned int K_>
+__global__ void shared_mm_sgemm_v1(float* A, float* B, float* C, const int M, const int N, const int K){
+    const int x = threadIdx.x + blockDim.x * blockIdx.x;
+    const int y = threadIdx.y + blockDim.y * blockIdx.y;
+    float* A_ptr_start = A + blockDim.y * blockIdx.y * K;
+    float* B_ptr_start = B + blockDim.x * blockIdx.x;
+
+    __shared__ float a_shared[BLOCK_SIZE_X][K_];
+    __shared__ float b_shared[K_][BLOCK_SIZE_Y];
+    
+    for(int s = 0; s < K; s += blockDim.x){
+        a_shared[threadIdx.y][s + threadIdx.x] = A_ptr_start[threadIdx.y * K + s + threadIdx.x];
+    }
+    for(int s = 0; s < K; s += blockDim.y){
+        b_shared[s + threadIdx.y][threadIdx.x] = B_ptr_start[(s + threadIdx.y) * N + threadIdx.x];
+    }
+    __syncthreads();
+
+    float temp = 0.f;
+    for(int k = 0; k < K; k++){
+        temp += a_shared[threadIdx.y][k] * b_shared[k][threadIdx.x];
+        
+    }
+    C[y * N + x] = temp;
+}
+//使用滑动窗口的方式，将矩阵按K维分块计算矩阵乘，减少共享内存的使用
+template<unsigned int BLOCK_SIZE>
+__global__ void shared_mm_sgemm_v2(float* A, float* B, float* C, const int M, const int N, const int K){
+    const int x = threadIdx.x + blockDim.x * blockIdx.x;
+    const int y = threadIdx.y + blockDim.y * blockIdx.y;
+    float* A_ptr_start = A + blockDim.y * blockIdx.y * K;
+    float* B_ptr_start = B + blockDim.x * blockIdx.x;
+
+    __shared__ float a_shared[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float b_shared[BLOCK_SIZE][BLOCK_SIZE];
+
+    float temp = 0.f;
+    
+    for(int s = 0; s < K; s += BLOCK_SIZE){
+        a_shared[threadIdx.y][threadIdx.x] = A_ptr_start[threadIdx.y * K + s + threadIdx.x];
+        b_shared[threadIdx.y][threadIdx.x] = B_ptr_start[(threadIdx.y + s) * N + threadIdx.x];
+        __syncthreads();
+        //计算小矩阵之间的mm
+        for(int i = 0; i < BLOCK_SIZE; i++){
+            temp += a_shared[threadIdx.y][i] * b_shared[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    
+    C[y * N + x] = temp;
+}
+
 int main(){
     int m = 16;
     int n = 16;
-    int k = 16;
+    constexpr int k = 16;
     const size_t mem_size_A = m * k * sizeof(float);
     const size_t mem_size_B = k * n * sizeof(float);
     const size_t mem_size_C = m * n * sizeof(float);
@@ -87,6 +141,20 @@ int main(){
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     float max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
+    printf("max_diff: %f\n", max_diff);
+
+    shared_mm_sgemm_v1<BLOCK_SIZE, BLOCK_SIZE, k><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    cudaDeviceSynchronize();
+    cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
+    printf("max_diff: %f\n", max_diff);
+
+    shared_mm_sgemm_v2<BLOCK_SIZE><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    cudaDeviceSynchronize();
+    cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
     printf("max_diff: %f\n", max_diff);
 
     free(matrix_A_host);
