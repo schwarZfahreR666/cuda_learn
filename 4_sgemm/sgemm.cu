@@ -14,9 +14,17 @@ float compare_matrices(int m, int n, float* a, float* b){
     float max_dif = 0.0, diff;
     for(int i = 0; i < m; i++){
         for(int j = 0; j < n; j++){
-            // printf("%f %f\n", a[i * n + j], b[i * n + j]);
+            
             diff = abs(a[i * n + j] - b[i * n + j]);
-            max_dif = (diff > max_dif ? diff : max_dif);
+            if(diff > max_dif){
+                max_dif = diff;
+            }
+            if(diff > 1){
+                printf("i[%d] j[%d] got %f %f\n",i, j, a[i * n + j], b[i * n + j]);
+                return max_dif;
+            }
+            
+            
         }
     }
     return max_dif;
@@ -36,15 +44,16 @@ void cpu_sgemm(float* A, float* B, float* C, const int M, const int N, const int
 
 //假设有m*n个线程，每个线程计算一个C中的元素
 __global__ void simple_sgemm(float* A, float* B, float* C, const int M, const int N, const int K){
-    const int x = threadIdx.x + blockDim.x * blockIdx.x;
-    const int y = threadIdx.y + blockDim.y * blockIdx.y;
+    const int64_t x = threadIdx.x + blockDim.x * blockIdx.x;
+    const int64_t y = threadIdx.y + blockDim.y * blockIdx.y;
     float* A_ptr_start = A + blockDim.y * blockIdx.y * K;
     float* B_ptr_start = B + blockDim.x * blockIdx.x;
     float temp = 0.f;
-    for(int k = 0; k < K; k++){
-        int a_idx = threadIdx.y * K + k;
-        int b_idx = threadIdx.x + k * N;
+    for(int64_t k = 0; k < K; k++){
+        int64_t a_idx = threadIdx.y * K + k;
+        int64_t b_idx = threadIdx.x + k * N;
         temp += A_ptr_start[a_idx] * B_ptr_start[b_idx];
+        // printf("temp:%f\n", temp);
         
     }
     C[y * N + x] = temp;
@@ -52,31 +61,31 @@ __global__ void simple_sgemm(float* A, float* B, float* C, const int M, const in
 
 //使用shared memory，读取内存次数从2KMN降为KMN(1/Bn+1/Bm)
 //但是每个block都加载block_size * k的数据，使用了太多共享内存
-template<unsigned int BLOCK_SIZE_X, unsigned int BLOCK_SIZE_Y, unsigned int K_>
-__global__ void shared_mm_sgemm_v1(float* A, float* B, float* C, const int M, const int N, const int K){
-    const int x = threadIdx.x + blockDim.x * blockIdx.x;
-    const int y = threadIdx.y + blockDim.y * blockIdx.y;
-    float* A_ptr_start = A + blockDim.y * blockIdx.y * K;
-    float* B_ptr_start = B + blockDim.x * blockIdx.x;
+// template<unsigned int BLOCK_SIZE_X, unsigned int BLOCK_SIZE_Y, unsigned int K_>
+// __global__ void shared_mm_sgemm_v1(float* A, float* B, float* C, const int M, const int N, const int K){
+//     const int x = threadIdx.x + blockDim.x * blockIdx.x;
+//     const int y = threadIdx.y + blockDim.y * blockIdx.y;
+//     float* A_ptr_start = A + blockDim.y * blockIdx.y * K;
+//     float* B_ptr_start = B + blockDim.x * blockIdx.x;
 
-    __shared__ float a_shared[BLOCK_SIZE_X][K_];
-    __shared__ float b_shared[K_][BLOCK_SIZE_Y];
+//     __shared__ float a_shared[BLOCK_SIZE_X][K_];
+//     __shared__ float b_shared[K_][BLOCK_SIZE_Y];
     
-    for(int s = 0; s < K; s += blockDim.x){
-        a_shared[threadIdx.y][s + threadIdx.x] = A_ptr_start[threadIdx.y * K + s + threadIdx.x];
-    }
-    for(int s = 0; s < K; s += blockDim.y){
-        b_shared[s + threadIdx.y][threadIdx.x] = B_ptr_start[(s + threadIdx.y) * N + threadIdx.x];
-    }
-    __syncthreads();
+//     for(int s = 0; s < K; s += blockDim.x){
+//         a_shared[threadIdx.y][s + threadIdx.x] = A_ptr_start[threadIdx.y * K + s + threadIdx.x];
+//     }
+//     for(int s = 0; s < K; s += blockDim.y){
+//         b_shared[s + threadIdx.y][threadIdx.x] = B_ptr_start[(s + threadIdx.y) * N + threadIdx.x];
+//     }
+//     __syncthreads();
 
-    float temp = 0.f;
-    for(int k = 0; k < K; k++){
-        temp += a_shared[threadIdx.y][k] * b_shared[k][threadIdx.x];
+//     float temp = 0.f;
+//     for(int k = 0; k < K; k++){
+//         temp += a_shared[threadIdx.y][k] * b_shared[k][threadIdx.x];
         
-    }
-    C[y * N + x] = temp;
-}
+//     }
+//     C[y * N + x] = temp;
+// }
 //使用滑动窗口的方式，将矩阵按K维分块计算矩阵乘，减少共享内存的使用
 template<unsigned int BLOCK_SIZE>
 __global__ void shared_mm_sgemm_v2(float* A, float* B, float* C, const int M, const int N, const int K){
@@ -104,10 +113,52 @@ __global__ void shared_mm_sgemm_v2(float* A, float* B, float* C, const int M, co
     C[y * N + x] = temp;
 }
 
+//每个block处理多个数据块
+template<unsigned int BLOCK_SIZE, unsigned int STRIDE>
+__global__ void shared_mm_sgemm_v3(float* A, float* B, float* C, const int M, const int N, const int K){
+    //每个block负责数据的单个维度
+    constexpr int STEP = BLOCK_SIZE * STRIDE;
+    float* A_ptr_start = A + STEP * blockIdx.y * K;
+    float* B_ptr_start = B + STEP * blockIdx.x;
+
+    __shared__ float a_shared[STEP][STEP];
+    __shared__ float b_shared[STEP][STEP];
+
+    float temp[STRIDE][STRIDE] = {0.f};
+    
+    for(int s = 0; s < K; s += STEP){
+        for(int i = 0; i < STRIDE; i++){
+            for(int j = 0; j < STRIDE; j++){
+                a_shared[i * BLOCK_SIZE + threadIdx.y][j * BLOCK_SIZE + threadIdx.x] = A_ptr_start[(threadIdx.y + BLOCK_SIZE * i) * K + s + threadIdx.x + BLOCK_SIZE * j];
+                b_shared[i * BLOCK_SIZE + threadIdx.y][j * BLOCK_SIZE + threadIdx.x] = B_ptr_start[(threadIdx.y + BLOCK_SIZE * i + s) * N + threadIdx.x + BLOCK_SIZE * j];
+            }
+        }
+        __syncthreads();
+        //计算小矩阵之间的mm
+        for(int i = 0; i < STRIDE; i++){
+            for(int j = 0; j < STRIDE; j++){
+                for(int k = 0; k < STEP; k++){
+                    temp[i][j] += a_shared[threadIdx.y + BLOCK_SIZE * i][k] * b_shared[k][threadIdx.x + BLOCK_SIZE * j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for(int i = 0; i < STRIDE; i++){
+        for(int j = 0; j < STRIDE; j++){
+            //每个维度考虑全局block偏移+block内偏移
+            int x = threadIdx.x + BLOCK_SIZE * j + STEP * blockIdx.x;
+            int y = threadIdx.y + BLOCK_SIZE * i + STEP * blockIdx.y;
+            C[y * N + x] = temp[i][j];    
+        }
+    }
+    
+}
+
 int main(){
-    int m = 16;
-    int n = 16;
-    constexpr int k = 16;
+    int m = 1024;
+    int n = 1024;
+    constexpr int k = 1024;
     const size_t mem_size_A = m * k * sizeof(float);
     const size_t mem_size_B = k * n * sizeof(float);
     const size_t mem_size_C = m * n * sizeof(float);
@@ -132,25 +183,45 @@ int main(){
 
     cpu_sgemm(matrix_A_host, matrix_B_host, matrix_C_host_cpu, m, n, k);
 
-    constexpr size_t BLOCK_SIZE = 16;
+    constexpr size_t BLOCK_SIZE = 32;
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     //二维网格，分别也和m、n的大小有关
     dim3 grid((m + BLOCK_SIZE - 1) / BLOCK_SIZE, (n + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    cudaMemset(matrix_C_device, 0, mem_size_C);
     simple_sgemm<<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Launch failed: %s\n", cudaGetErrorString(err));
+    }
     cudaDeviceSynchronize();
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     float max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
     printf("max_diff: %f\n", max_diff);
 
-    shared_mm_sgemm_v1<BLOCK_SIZE, BLOCK_SIZE, k><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    // cudaMemset(matrix_C_device, 0, mem_size_C);
+    // shared_mm_sgemm_v1<BLOCK_SIZE, BLOCK_SIZE, k><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
+    // cudaDeviceSynchronize();
+    // max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
+    // printf("max_diff: %f\n", max_diff);
+
+    cudaMemset(matrix_C_device, 0, mem_size_C);
+    shared_mm_sgemm_v2<BLOCK_SIZE><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
     cudaDeviceSynchronize();
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
     printf("max_diff: %f\n", max_diff);
 
-    shared_mm_sgemm_v2<BLOCK_SIZE><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    dim3 block_v3(BLOCK_SIZE, BLOCK_SIZE);
+    constexpr int STRIDE = 2;
+    //二维网格，分别也和m、n的大小有关
+    //只使用原来的四分之一block
+    dim3 grid_v3((m + BLOCK_SIZE - 1) / BLOCK_SIZE / STRIDE, (n + BLOCK_SIZE - 1) / BLOCK_SIZE / STRIDE);
+    cudaMemset(matrix_C_device, 0, mem_size_C);
+    shared_mm_sgemm_v3<BLOCK_SIZE, STRIDE><<<grid_v3, block_v3>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
     cudaDeviceSynchronize();
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
