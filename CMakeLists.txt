@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.9 FATAL_ERROR)
 Project(cuda_learn CXX C CUDA)
-set(CMAKE_CUDA_FLAGS "-arch=compute_89 -g -G -O3")
+set(CMAKE_CUDA_FLAGS "-arch=compute_89 -code=sm_89 -g -G -O3")
 SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_BUILD_DIR})
 
 include_directories(./include)
