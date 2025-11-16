@@ -113,7 +113,7 @@ __global__ void shared_mm_sgemm_v2(float* A, float* B, float* C, const int M, co
     C[y * N + x] = temp;
 }
 
-//每个block处理多个数据块
+//每个block处理多个数据块,该实现每个block计算连续的STRIDE个块
 template<unsigned int BLOCK_SIZE, unsigned int STRIDE>
 __global__ void shared_mm_sgemm_v3(float* A, float* B, float* C, const int M, const int N, const int K){
     //每个block负责数据的单个维度
@@ -155,7 +155,53 @@ __global__ void shared_mm_sgemm_v3(float* A, float* B, float* C, const int M, co
     
 }
 
+//每个block处理多个数据块，该实现每个block计算相隔M / STRIDE的块
+template<unsigned int BLOCK_SIZE, unsigned int STRIDE>
+__global__ void shared_mm_sgemm_v3_skip(float* A, float* B, float* C, const int M, const int N, const int K){
+    //每个block负责数据的单个维度
+    constexpr int STEP = BLOCK_SIZE * STRIDE;
+    float* A_ptr_start = A + BLOCK_SIZE * blockIdx.y * K;
+    float* B_ptr_start = B + BLOCK_SIZE * blockIdx.x;
+
+    int BLOCK_STEP = M / STRIDE;
+
+    __shared__ float a_shared[STEP][STEP];
+    __shared__ float b_shared[STEP][STEP];
+
+    float temp[STRIDE][STRIDE] = {0.f};
+    
+    for(int s = 0; s < K; s += BLOCK_SIZE){
+        for(int i = 0; i < STRIDE; i++){
+            for(int j = 0; j < STRIDE; j++){
+                a_shared[i * BLOCK_SIZE + threadIdx.y][j * BLOCK_SIZE + threadIdx.x] = A_ptr_start[(threadIdx.y + BLOCK_STEP * i) * K + s + threadIdx.x];
+                b_shared[i * BLOCK_SIZE + threadIdx.y][j * BLOCK_SIZE + threadIdx.x] = B_ptr_start[(threadIdx.y + s) * N + threadIdx.x + BLOCK_STEP * j];
+            }
+        }
+        __syncthreads();
+        //计算小矩阵之间的mm
+        for(int i = 0; i < STRIDE; i++){
+            for(int j = 0; j < STRIDE; j++){
+                for(int k = 0; k < BLOCK_SIZE; k++){
+                    temp[i][j] += a_shared[threadIdx.y + BLOCK_SIZE * i][k] * b_shared[k][threadIdx.x + BLOCK_SIZE * j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for(int i = 0; i < STRIDE; i++){
+        for(int j = 0; j < STRIDE; j++){
+            //每个维度考虑全局block偏移+block内偏移
+            int x = threadIdx.x + BLOCK_STEP * j + BLOCK_SIZE * blockIdx.x;
+            int y = threadIdx.y + BLOCK_STEP * i + BLOCK_SIZE * blockIdx.y;
+            C[y * N + x] = temp[i][j];    
+        }
+    }
+    
+}
+
 int main(){
+    double iStart, iElaps;
+
     int m = 1024;
     int n = 1024;
     constexpr int k = 1024;
@@ -180,24 +226,28 @@ int main(){
 
     cudaMemcpy(matrix_A_device, matrix_A_host, mem_size_A, cudaMemcpyHostToDevice);
     cudaMemcpy(matrix_B_device, matrix_B_host, mem_size_B, cudaMemcpyHostToDevice);
-
+    iStart = cpuSecond();
     cpu_sgemm(matrix_A_host, matrix_B_host, matrix_C_host_cpu, m, n, k);
-
+    iElaps = cpuSecond() - iStart;
+    printf("cpu_sgemm time: %lf\n", iElaps);
     constexpr size_t BLOCK_SIZE = 32;
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     //二维网格，分别也和m、n的大小有关
     dim3 grid((m + BLOCK_SIZE - 1) / BLOCK_SIZE, (n + BLOCK_SIZE - 1) / BLOCK_SIZE);
     cudaMemset(matrix_C_device, 0, mem_size_C);
+    memset(matrix_C_host_gpu, 0, mem_size_C);
+    iStart = cpuSecond();
     simple_sgemm<<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Launch failed: %s\n", cudaGetErrorString(err));
-    }
+    // cudaError_t err = cudaGetLastError();
+    // if (err != cudaSuccess) {
+    //     printf("Launch failed: %s\n", cudaGetErrorString(err));
+    // }
     cudaDeviceSynchronize();
+    iElaps = cpuSecond() - iStart;
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     float max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
-    printf("max_diff: %f\n", max_diff);
+    printf("simple_sgemm time: %lf , max_diff: %f\n", iElaps, max_diff);
 
     // cudaMemset(matrix_C_device, 0, mem_size_C);
     // shared_mm_sgemm_v1<BLOCK_SIZE, BLOCK_SIZE, k><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
@@ -208,12 +258,15 @@ int main(){
     // printf("max_diff: %f\n", max_diff);
 
     cudaMemset(matrix_C_device, 0, mem_size_C);
+    memset(matrix_C_host_gpu, 0, mem_size_C);
+    iStart = cpuSecond();
     shared_mm_sgemm_v2<BLOCK_SIZE><<<grid, block>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
     cudaDeviceSynchronize();
+    iElaps = cpuSecond() - iStart;
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
-    printf("max_diff: %f\n", max_diff);
+    printf("shared_mm_sgemm_v2 time: %lf , max_diff: %f\n", iElaps, max_diff);
 
     dim3 block_v3(BLOCK_SIZE, BLOCK_SIZE);
     constexpr int STRIDE = 2;
@@ -221,12 +274,26 @@ int main(){
     //只使用原来的四分之一block
     dim3 grid_v3((m + BLOCK_SIZE - 1) / BLOCK_SIZE / STRIDE, (n + BLOCK_SIZE - 1) / BLOCK_SIZE / STRIDE);
     cudaMemset(matrix_C_device, 0, mem_size_C);
+    memset(matrix_C_host_gpu, 0, mem_size_C);
+    iStart = cpuSecond();
     shared_mm_sgemm_v3<BLOCK_SIZE, STRIDE><<<grid_v3, block_v3>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
     cudaDeviceSynchronize();
+    iElaps = cpuSecond() - iStart;
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
-    printf("max_diff: %f\n", max_diff);
+    printf("shared_mm_sgemm_v3 time: %lf , max_diff: %f\n", iElaps, max_diff);
+
+    cudaMemset(matrix_C_device, 0, mem_size_C);
+    memset(matrix_C_host_gpu, 0, mem_size_C);
+    iStart = cpuSecond();
+    shared_mm_sgemm_v3_skip<BLOCK_SIZE, STRIDE><<<grid_v3, block_v3>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    cudaDeviceSynchronize();
+    iElaps = cpuSecond() - iStart;
+    cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
+    printf("shared_mm_sgemm_v3_skip time: %lf , max_diff: %f\n", iElaps, max_diff);
 
     free(matrix_A_host);
     free(matrix_B_host);
