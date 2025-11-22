@@ -199,6 +199,47 @@ __global__ void shared_mm_sgemm_v3_skip(float* A, float* B, float* C, const int 
     
 }
 
+//使用float4按行取数
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4 *>(&(pointer))[0])
+template<unsigned int M_NUM_PER_BLOCK, 
+        unsigned int N_NUM_PER_BLOCK, 
+        unsigned int K_NUM_PER_BLOCK, 
+        unsigned int NUM_PER_THREAD>
+__global__ void shared_mm_sgemm_float4(float* A, float* B, float* C, const int M, const int N, const int K){
+    //每个block负责数据的单个维度
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    float* A_ptr_start = A + M_NUM_PER_BLOCK * blockIdx.y * K;
+    float* B_ptr_start = B + N_NUM_PER_BLOCK * blockIdx.x;
+
+    __shared__ float a_shared[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
+    __shared__ float b_shared[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
+
+    float temp[NUM_PER_THREAD] = {0.f};
+    
+    for(int s = 0; s < K; s += K_NUM_PER_BLOCK){
+        //a_shared[ty][tx * NUM_PER_THREAD + (0/1/2/3)] = A_ptr_start[ty * K + s + threadIdx.x * NUM_PER_THREAD + (0/1/2/3)]
+        FETCH_FLOAT4(a_shared[ty][tx * NUM_PER_THREAD]) = FETCH_FLOAT4(A_ptr_start[ty * K + s + threadIdx.x * NUM_PER_THREAD]);
+        
+        FETCH_FLOAT4(b_shared[ty][tx * NUM_PER_THREAD]) = FETCH_FLOAT4(B_ptr_start[(ty + s) * N + tx * NUM_PER_THREAD]);
+            
+        __syncthreads();
+        //计算小矩阵之间的mm
+        for(int i = 0; i < NUM_PER_THREAD; i++){
+            for(int k = 0; k < K_NUM_PER_BLOCK; k++){
+                temp[i] += a_shared[ty][k] * b_shared[k][tx * NUM_PER_THREAD + i];
+            }
+        }
+        __syncthreads();
+    }
+    float* c_ptr_start = C + blockIdx.y * N * M_NUM_PER_BLOCK + blockIdx.x * N_NUM_PER_BLOCK;
+    for(int i = 0; i < NUM_PER_THREAD; i++){
+        //每个维度考虑全局block偏移+block内偏移
+        c_ptr_start[ty * N + tx * NUM_PER_THREAD + i] = temp[i];    
+    }
+    
+}
+
 int main(){
     double iStart, iElaps;
 
@@ -294,6 +335,31 @@ int main(){
     cudaDeviceSynchronize();
     max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
     printf("shared_mm_sgemm_v3_skip time: %lf , max_diff: %f\n", iElaps, max_diff);
+
+    //先规定好每个block在每个维度处理多少个数(从目标矩阵看)
+    constexpr int M_NUM_PER_BLOCK = 32;
+    constexpr int N_NUM_PER_BLOCK = 32;
+    constexpr int K_NUM_PER_BLOCK = 32;
+    
+    constexpr int NUM_PER_THREAD = 4; //每个thread输出几个结果
+    constexpr size_t ROW_SIZE = 8;   //每一行可以按照float4读数，所以是32的四分之一
+    constexpr size_t COL_SIZE = 32;
+    dim3 block_float4(ROW_SIZE, COL_SIZE);
+    
+    //二维网格，分别也和m、n的大小有关
+    //只使用原来的四分之一block
+    dim3 grid_float4((m + M_NUM_PER_BLOCK - 1) / M_NUM_PER_BLOCK, (n + N_NUM_PER_BLOCK - 1) / N_NUM_PER_BLOCK);
+    cudaMemset(matrix_C_device, 0, mem_size_C);
+    memset(matrix_C_host_gpu, 0, mem_size_C);
+    iStart = cpuSecond();
+    shared_mm_sgemm_float4<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_float4, block_float4>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    cudaDeviceSynchronize();
+    iElaps = cpuSecond() - iStart;
+    cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
+    printf("shared_mm_sgemm_float4 time: %lf , max_diff: %f\n", iElaps, max_diff);
+
 
     free(matrix_A_host);
     free(matrix_B_host);
