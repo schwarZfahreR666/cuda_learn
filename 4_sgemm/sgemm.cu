@@ -250,7 +250,7 @@ __global__ void shared_mm_sgemm_float4_register(float* A, float* B, float* C, co
     int ty = threadIdx.y;
     //计算全局线程索引，然后重排成ctx * cty的方block
     int tid = ty * blockDim.x + tx;
-    int ctx = tid % 16;
+    int ctx = tid % 16; //32 * 8排成方阵就是16*16
     int cty = tid / 16;
     float* A_ptr_start = A + M_NUM_PER_BLOCK * blockIdx.y * K;
     float* B_ptr_start = B + N_NUM_PER_BLOCK * blockIdx.x;
@@ -258,7 +258,7 @@ __global__ void shared_mm_sgemm_float4_register(float* A, float* B, float* C, co
     __shared__ float a_shared[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
     __shared__ float b_shared[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
     
-    //每个线程依然负责计算NUM_PER_THREAD个数
+    //每个线程依然负责计算NUM_PER_THREAD个数，故每个维度要除以2
     constexpr int REG_NUM = NUM_PER_THREAD / 2;
     float temp[REG_NUM][REG_NUM] = {0.f};
     float a_reg[REG_NUM] = {0.f};
@@ -276,10 +276,10 @@ __global__ void shared_mm_sgemm_float4_register(float* A, float* B, float* C, co
             //先把固定k的位置的数加载到寄存器
             //一共32*32个数，16*16个线程。
             //每个线程负责计算四个数，x、y方向各加载两个数
-            a_reg[0] = a_shared[cty * 2][k];
-            a_reg[1] = a_shared[cty * 2 + 1][k];
-            b_reg[0] = b_shared[k][ctx * 2];
-            b_reg[1] = b_shared[k][ctx * 2 + 1];
+            a_reg[0] = a_shared[cty * REG_NUM][k];
+            a_reg[1] = a_shared[cty * REG_NUM + 1][k];
+            b_reg[0] = b_shared[k][ctx * REG_NUM];
+            b_reg[1] = b_shared[k][ctx * REG_NUM + 1];
             for(int i = 0; i < REG_NUM; i++){
                 for(int j = 0; j < REG_NUM; j++){
                     temp[i][j] += a_reg[i] * b_reg[j];
@@ -295,7 +295,7 @@ __global__ void shared_mm_sgemm_float4_register(float* A, float* B, float* C, co
             //每个维度考虑全局block偏移+block内偏移
             //每个thread将负责计算的4个数写回全局内存
             //block偏移已经算好了，计算block内偏移即可
-            c_ptr_start[(cty * 2 + i) * N + ctx * 2 + j] = temp[i][j];
+            c_ptr_start[(cty * REG_NUM + i) * N + ctx * REG_NUM + j] = temp[i][j];
         }    
     }
     
