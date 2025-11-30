@@ -240,11 +240,12 @@ __global__ void shared_mm_sgemm_float4(float* A, float* B, float* C, const int M
     
 }
 
+//计算模式由内积转为外积
 template<unsigned int M_NUM_PER_BLOCK, 
         unsigned int N_NUM_PER_BLOCK, 
         unsigned int K_NUM_PER_BLOCK, 
         unsigned int NUM_PER_THREAD>
-__global__ void shared_mm_sgemm_float4_register(float* A, float* B, float* C, const int M, const int N, const int K){
+__global__ void outer_sgemm_register(float* A, float* B, float* C, const int M, const int N, const int K){
     //每个block负责数据的单个维度
     int tx = threadIdx.x;
     int ty = threadIdx.y;
@@ -255,8 +256,8 @@ __global__ void shared_mm_sgemm_float4_register(float* A, float* B, float* C, co
     float* A_ptr_start = A + M_NUM_PER_BLOCK * blockIdx.y * K;
     float* B_ptr_start = B + N_NUM_PER_BLOCK * blockIdx.x;
 
-    __shared__ float a_shared[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
-    __shared__ float b_shared[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
+    __shared__ float a_shared[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK + 4];
+    __shared__ float b_shared[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK + 4];
     
     //每个线程依然负责计算NUM_PER_THREAD个数，故每个维度要除以2
     constexpr int REG_NUM = NUM_PER_THREAD / 2;
@@ -299,6 +300,78 @@ __global__ void shared_mm_sgemm_float4_register(float* A, float* B, float* C, co
         }    
     }
     
+}
+
+
+//使用float4加载数据
+template<unsigned int M_NUM_PER_BLOCK, 
+        unsigned int N_NUM_PER_BLOCK, 
+        unsigned int K_NUM_PER_BLOCK, 
+        unsigned int M_NUM_PER_THREAD,
+        unsigned int N_NUM_PER_THREAD>
+__global__ void outer_sgemm_register_float4(float* A, float* B, float* C, const int M, const int N, const int K){
+    //每个block负责数据的单个维度
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    
+    float* A_ptr_start = A + M_NUM_PER_BLOCK * blockIdx.y * K;
+    float* B_ptr_start = B + N_NUM_PER_BLOCK * blockIdx.x;
+
+    __shared__ float a_shared[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
+    __shared__ float b_shared[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
+    
+    //每个线程依然负责计算NUM_PER_THREAD个数
+    float temp[M_NUM_PER_THREAD][N_NUM_PER_THREAD] = {0.f};
+    float a_reg[M_NUM_PER_THREAD] = {0.f};
+    float b_reg[N_NUM_PER_THREAD] = {0.f};
+    
+    int K_NUM_PER_THREAD = 4; //这个大小是由float4指令决定的
+    for(int s = 0; s < K; s += K_NUM_PER_BLOCK){
+        //每次取4个数，要取4次，因为A的取次数要与B的一次取得数相匹配，都为4
+        for(int i = 0; i < M_NUM_PER_THREAD; i++){
+            FETCH_FLOAT4(a_shared[ty * M_NUM_PER_THREAD + i][tx * K_NUM_PER_THREAD]) = FETCH_FLOAT4(A_ptr_start[(ty * M_NUM_PER_THREAD + i) * K + s + tx * K_NUM_PER_THREAD]); //在y方向，每个线程负责加载M_NUM_PER_THREAD行数据，所以要乘这个值
+        }
+        for(int i = 0; i < K_NUM_PER_THREAD; i++){
+            FETCH_FLOAT4(b_shared[ty * K_NUM_PER_THREAD + i][tx * N_NUM_PER_THREAD]) = FETCH_FLOAT4(B_ptr_start[(ty * K_NUM_PER_THREAD + s + i) * N + tx * N_NUM_PER_THREAD]);
+        }
+        
+            
+        __syncthreads();
+        //计算小矩阵之间的mm
+        for(int k = 0; k < K_NUM_PER_BLOCK; k++){
+            //先把固定k的位置的数加载到寄存器
+            //一共64*64个数，16*16个线程。
+            //每个线程负责计算16个数，x、y方向各加载4个数
+            //A取列，不能使用float4取数
+            a_reg[0] = a_shared[ty * M_NUM_PER_THREAD + 0][k];
+            a_reg[1] = a_shared[ty * M_NUM_PER_THREAD + 1][k];
+            a_reg[2] = a_shared[ty * M_NUM_PER_THREAD + 2][k];
+            a_reg[3] = a_shared[ty * M_NUM_PER_THREAD + 3][k];
+            //B取行，可以使用float4取数
+            FETCH_FLOAT4(b_reg[0]) = FETCH_FLOAT4(b_shared[k][tx * N_NUM_PER_THREAD]);
+            
+            for(int i = 0; i < M_NUM_PER_THREAD; i++){
+                for(int j = 0; j < N_NUM_PER_THREAD; j++){
+                    temp[i][j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+        
+        __syncthreads();
+    }
+    float* c_ptr_start = C + blockIdx.y * N * M_NUM_PER_BLOCK + blockIdx.x * N_NUM_PER_BLOCK;
+    // for(int i = 0; i < M_NUM_PER_THREAD; i++){
+    //     for(int j = 0; j < N_NUM_PER_THREAD; j++){
+    //         //每个维度考虑全局block偏移+block内偏移
+    //         //每个thread将负责计算的16个数写回全局内存
+    //         //block偏移已经算好了，计算block内偏移即可
+    //         c_ptr_start[(ty * M_NUM_PER_THREAD + i) * N + tx * N_NUM_PER_THREAD + j] = temp[i][j];
+    //     }    
+    // }
+    //写入也可以使用float4
+    for(int i = 0; i < M_NUM_PER_THREAD; i++){
+        FETCH_FLOAT4(c_ptr_start[(ty * M_NUM_PER_THREAD + i) * N + tx * N_NUM_PER_THREAD]) = FETCH_FLOAT4(temp[i][0]);
+    }
 }
 
 int main(){
@@ -425,14 +498,41 @@ int main(){
     cudaMemset(matrix_C_device, 0, mem_size_C);
     memset(matrix_C_host_gpu, 0, mem_size_C);
     iStart = cpuSecond();
-    shared_mm_sgemm_float4_register<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_float4, block_float4>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    outer_sgemm_register<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_float4, block_float4>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
     cudaDeviceSynchronize();
     iElaps = cpuSecond() - iStart;
     cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
     max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
-    printf("shared_mm_sgemm_float4_register time: %lf , max_diff: %f\n", iElaps, max_diff);
+    printf("outer_sgemm_register time: %lf , max_diff: %f\n", iElaps, max_diff);
 
+    //先规定好每个block在每个维度处理多少个数(从目标矩阵看)
+    constexpr int M_NUM_PER_BLOCK_OUTER = 64;
+    constexpr int N_NUM_PER_BLOCK_OUTER = 64;
+    constexpr int K_NUM_PER_BLOCK_OUTER = 64;
+    
+    constexpr int NUM_PER_THREAD_OUTER = 16; //每个thread输出几个结果
+    constexpr int M_NUM_PER_THREAD_OUTER = 4;  //每个线程在每个维度计算几个数，两个乘积应该是NUM_PER_THREAD_OUTER
+    constexpr int N_NUM_PER_THREAD_OUTER = 4;
+    constexpr size_t ROW_SIZE_OUTER = 16;   //每一行可以按照float4读数，所以是64的四分之一
+    constexpr size_t COL_SIZE_OUTER = 16;
+    dim3 block_float4_outer(ROW_SIZE_OUTER, COL_SIZE_OUTER);
+    
+    //二维网格，分别也和m、n的大小有关
+    //只使用原来的四分之一block
+    dim3 grid_float4_outer((m + M_NUM_PER_BLOCK_OUTER - 1) / M_NUM_PER_BLOCK_OUTER, (n + N_NUM_PER_BLOCK_OUTER - 1) / N_NUM_PER_BLOCK_OUTER);
+    cudaMemset(matrix_C_device, 0, mem_size_C);
+    memset(matrix_C_host_gpu, 0, mem_size_C);
+    iStart = cpuSecond();
+    outer_sgemm_register_float4<M_NUM_PER_BLOCK_OUTER, N_NUM_PER_BLOCK_OUTER, K_NUM_PER_BLOCK_OUTER, M_NUM_PER_THREAD_OUTER, N_NUM_PER_THREAD_OUTER><<<grid_float4_outer, block_float4_outer>>>(matrix_A_device, matrix_B_device, matrix_C_device, m, n, k);
+    cudaDeviceSynchronize();
+    iElaps = cpuSecond() - iStart;
+    cudaMemcpy(matrix_C_host_gpu, matrix_C_device, mem_size_C, cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+    max_diff = compare_matrices(m, n, matrix_C_host_cpu, matrix_C_host_gpu);
+    printf("outer_sgemm_register_float4 time: %lf , max_diff: %f\n", iElaps, max_diff);
+    
+    
     free(matrix_A_host);
     free(matrix_B_host);
     free(matrix_C_host_cpu);
