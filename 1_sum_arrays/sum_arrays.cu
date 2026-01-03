@@ -16,7 +16,6 @@ void sumArrays(float * a,float * b,float * res,const int size)
 __global__ void sumArraysGPU(float*a,float*b,float*res)
 {
   //int i=threadIdx.x;
-  //一维线程块映射到一维内存地址
   int i=blockIdx.x*blockDim.x+threadIdx.x;
   res[i]=a[i]+b[i];
 }

@@ -18,7 +18,7 @@ fi
 
 cd $PROJECT_BUILD_DIR
 
-cmake .. && make
+cmake .. -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=89 && make
 
 # 拷贝无扩展名的可执行文件
 find "$PROJECT_BUILD_DIR" -type f -executable ! -name "*.*" -exec cp {} $PROJECT_SOURCE_DIR"/out/" \;

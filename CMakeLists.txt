@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.9 FATAL_ERROR)
 Project(cuda_learn CXX C CUDA)
 # compute表示编译出的ptx版本，还需要jit才能运行
 # sm是实际二进制的版本
-set(CMAKE_CUDA_FLAGS "-gencode arch=compute_89,code=compute_89 -gencode arch=compute_89,code=sm_89 -g -G -src-in-ptx -lineinfo -Xptxas -v")
+set(CMAKE_CUDA_FLAGS "-gencode arch=compute_89,code=compute_89 -gencode arch=compute_89,code=sm_89 -g -lineinfo")
 SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_BUILD_DIR})
 
 include_directories(./include)

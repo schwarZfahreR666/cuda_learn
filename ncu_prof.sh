@@ -1,0 +1,1 @@
+ncu  --print-details all --set full -o ./$2 $1
