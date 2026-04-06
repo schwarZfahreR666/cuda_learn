@@ -193,6 +193,7 @@ __global__ void transpose_shared_mem_padding(float* input, float* output, const 
     
 }
 
+//做了线程粗化
 template<const int BLOCK_SIZE, const int NUM_PER_THREAD>
 __global__ void transpose_shared_mem_padding_multi(float* input, float* output, const int M, const int N){
     __shared__ float sdata[BLOCK_SIZE][BLOCK_SIZE + 1];
