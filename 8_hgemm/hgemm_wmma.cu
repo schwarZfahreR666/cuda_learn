@@ -342,7 +342,7 @@ hgemm_wmma_m16n16k16_mma4x2_warp2x4_dbuf_async_kernel(half *A, half *B, half *C,
   const int warp_n = warp_id % 2;      // 0,1
 
   // 0. 先计算shared memory中的索引
-  // tid和需要加载的smem s_a[BM][BK] 之间的索引关系 BM=128 BK=8 按行读取 A行主序
+  // tid和需要加载的smem s_a[BM][BK] 之间的索引关系 BM=128 BK=16 按行读取 A行主序
   // 对于s_a每行16个数据，每个线程读取8个，需要2个线程；总共128行，需要128x2刚好256线程
   int load_smem_a_m = tid / 2;                // row 0~127
   int load_smem_a_k = (tid % 2 == 0) ? 0 : 8; // col 0,8

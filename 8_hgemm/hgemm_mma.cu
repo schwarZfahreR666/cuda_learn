@@ -19,6 +19,7 @@ using namespace nvcuda;
 #define LDST64BITS(value) (reinterpret_cast<float2 *>(&(value))[0])
 #define LDST128BITS(value) (reinterpret_cast<float4 *>(&(value))[0])
 
+// ca数据进入L1、L2 cache，cg数据直接进入L2，不进L1。ca多次访问比较快，cg适合一次性访问的数据。
 #define CP_ASYNC_CA(dst, src, bytes)                                           \
   asm volatile(                                                                \
       "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(dst),       \
